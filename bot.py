@@ -1,96 +1,170 @@
 import os
-import yt_dlp
+import re
+import uuid
+import shutil
+import asyncio
 import logging
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from dotenv import load_dotenv
-from uuid import uuid4
+from datetime import datetime, timedelta
 
-load_dotenv()
-
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Load token from environment
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID", "123456"))
-API_HASH = os.getenv("API_HASH")
-
-# Allowed platforms
-SUPPORTED_DOMAINS = ["youtube.com", "youtu.be", "instagram.com", "tiktok.com", "facebook.com", "fb.watch", "x.com", "twitter.com"]
-
-app = Client("universal_video_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# --- Start Command ---
-@app.on_message(filters.command("start"))
-async def start(client, message: Message):
-    await message.reply_text(
-        "✨ Just send a valid video link and let the magic happen ✨\n\n"
-        "Need help or want to request new features? Contact the creator.",
+try:
+    from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+    from telegram.ext import (
+        ApplicationBuilder, CommandHandler,
+        MessageHandler, CallbackQueryHandler,
+        ContextTypes, filters
     )
+except ImportError:
+    print("❌ telegram module not installed. Please run: pip install python-telegram-bot")
+    exit(1)
 
-# --- Main Handler ---
-@app.on_message(filters.text & ~filters.command(["start"]))
-async def downloader(client, message: Message):
-    url = message.text.strip()
-    logging.info(f"Received URL: {url}")
+from yt_dlp import YoutubeDL
 
-    if not any(domain in url for domain in SUPPORTED_DOMAINS):
-        await message.reply("❌ Unsupported or invalid URL. Try a YouTube, Instagram, TikTok, Facebook or Twitter link.")
-        return
+# --- CONFIGURATION ---
+BOT_TOKEN = "7567180824:AAHDw3DvJkht4OOn8qVjYvkI4mhEMP7X868"
+MAX_FILE_SIZE_MB = 49
+CLEANUP_AFTER_HOURS = 24
 
-    if "youtube.com" in url or "youtu.be" in url:
-        buttons = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("🎥 Video (MP4)", callback_data=f"yt_video|{url}"),
-                InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"yt_audio|{url}")
-            ]]
-        )
-        await message.reply("Please choose format:", reply_markup=buttons)
+YOUTUBE_REGEX = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/"
+TIKTOK_REGEX = r"(https?://)?(www\.)?tiktok\.com/"
+INSTA_REGEX = r"(https?://)?(www\.)?instagram\.com/"
+FACEBOOK_REGEX = r"(https?://)?(www\.)?(facebook\.com|fb\.watch)/"
+TWITTER_REGEX = r"(https?://)?(twitter\.com|x\.com)/"
+GENERAL_URL_REGEX = r"https?://[^\s]+"
+
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO)
+
+
+# --- COMMANDS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    intro = (
+        "🎉 <b>Welcome to UNIVERSAL DOWNLOADER!</b>\n\n"
+        "🚀 Download from:\n"
+        "• <b>YouTube</b> → MP4 or MP3\n"
+        "• <b>TikTok</b>, <b>Instagram</b> → Clean MP4 only\n"
+        "• <b>Facebook</b>, <b>X</b>, <b>Others</b> → direct video\n\n"
+        "🧹 Files clean after 24 hours.\n"
+        "🔗 Just send a video URL.\n\n"
+        "<i>Built by @kerajsrs 🛠</i>"
+    )
+    await update.message.reply_html(intro)
+
+
+# --- ROUTING ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if re.search(YOUTUBE_REGEX, text):
+        await send_youtube_options(update, text)
+    elif any(re.search(p, text) for p in [TIKTOK_REGEX, INSTA_REGEX, FACEBOOK_REGEX, TWITTER_REGEX]):
+        await download_and_send(text, update.message, audio_only=False)
+    elif re.match(GENERAL_URL_REGEX, text):
+        await download_and_send(text, update.message, audio_only=False)
     else:
-        await process_and_send(client, message, url, audio_only=False)
+        await update.message.reply_text("❗ Invalid or unsupported link.")
 
-# --- Button Callback Handler ---
-@app.on_callback_query()
-async def button_handler(client, callback_query):
-    await callback_query.answer()
-    data = callback_query.data
-    action, url = data.split("|", 1)
 
-    audio_only = action == "yt_audio"
-    await process_and_send(client, callback_query.message, url, audio_only)
+async def send_youtube_options(update: Update, url: str):
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎥 Video (MP4)", callback_data=f"yt_video|{url}"),
+        InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"yt_audio|{url}")
+    ]])
+    await update.message.reply_text("Choose format:", reply_markup=keyboard)
 
-# --- Core Function ---
-async def process_and_send(client, message: Message, url: str, audio_only: bool = False):
-    msg = await message.reply("⏳ Processing your download...")
-    file_id = uuid4().hex
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    action, url = query.data.split('|')
+    audio_only = (action == "yt_audio")
+
+    await query.edit_message_text("⏳ Please wait... downloading...")
+    await download_and_send(url, query.message, audio_only)
+
+
+# --- CORE DOWNLOADER ---
+async def download_and_send(url: str, msg_source, audio_only=False):
+    unique_id = str(uuid.uuid4())
+    temp_dir = os.path.join(DOWNLOAD_DIR, unique_id)
+    os.makedirs(temp_dir, exist_ok=True)
 
     ydl_opts = {
-        "format": "bestaudio/best" if audio_only else "best",
-        "outtmpl": f"{file_id}.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "merge_output_format": "mp3" if audio_only else "mp4",
-        "noplaylist": True,
-        "geo_bypass": True,
+        'outtmpl': f'{temp_dir}/%(title).50s.%(ext)s',
+        'format': 'bestaudio/best' if audio_only else 'bestvideo+bestaudio/best',
+        'merge_output_format': 'mp4' if not audio_only else 'mp3',
+        'noplaylist': True,
+        'quiet': True,
+        'writethumbnail': True,
+        'writeinfojson': True,
+        'postprocessors': [
+            {
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+            }
+        ] if audio_only else [
+            {
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4'
+            }
+        ]
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            title = info.get("title", "Downloaded")
-            ext = "mp3" if audio_only else filename.split(".")[-1]
-            final_file = f"{file_id}.{ext}"
+        progress = await msg_source.reply_text("⏬ Processing your request...")
 
-        if os.path.exists(final_file):
-            caption = f"✅ <b>{title}</b>"
-            await message.reply_document(final_file, caption=caption, parse_mode="HTML")
-            await msg.delete()
-            os.remove(final_file)
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        files = os.listdir(temp_dir)
+        target_file = next((f for f in files if f.endswith(".mp4") or f.endswith(".mp3")), None)
+        thumb_file = next((f for f in files if f.endswith(".jpg")), None)
+
+        if not target_file:
+            raise Exception("Download failed: file not found.")
+
+        full_path = os.path.join(temp_dir, target_file)
+        if os.path.getsize(full_path) > MAX_FILE_SIZE_MB * 1024 * 1024:
+            await msg_source.reply_text("⚠️ File too large for Telegram (>50MB).")
+            return
+
+        caption = f"✅ Downloaded: <b>{target_file}</b>"
+        if audio_only:
+            await msg_source.reply_audio(audio=InputFile(full_path), caption=caption, parse_mode="HTML")
         else:
-            await msg.edit("❌ Download failed. File not found.")
-    except Exception as e:
-        logging.error("Download error", exc_info=e)
-        await msg.edit(f"❌ Error: {str(e)}")
+            await msg_source.reply_video(video=InputFile(full_path), caption=caption, parse_mode="HTML",
+                                         thumbnail=os.path.join(temp_dir, thumb_file) if thumb_file else None)
 
+        await progress.delete()
+
+    except Exception as e:
+        await msg_source.reply_text(f"❌ Error:\n<code>{str(e)}</code>", parse_mode="HTML")
+    finally:
+        await cleanup_old_files()
+
+
+# --- CLEANUP ---
+async def cleanup_old_files():
+    now = datetime.now()
+    for folder in os.listdir(DOWNLOAD_DIR):
+        folder_path = os.path.join(DOWNLOAD_DIR, folder)
+        if os.path.isdir(folder_path):
+            modified = datetime.fromtimestamp(os.path.getmtime(folder_path))
+            if now - modified > timedelta(hours=CLEANUP_AFTER_HOURS):
+                shutil.rmtree(folder_path, ignore_errors=True)
+
+
+# --- MAIN ---
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("✅ Bot is running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
